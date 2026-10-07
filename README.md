@@ -129,8 +129,6 @@ mismatch ratio : 0%
 
 ![Vivado implementation result](https://velog.velcdn.com/images/vom/post/15c43b43-1508-4b1a-b43f-9690c00294e2/image.png)
 
-> WNS, Utilization, Power 값은 프로젝트 당시 기록한 결과이며, 원본 report를 추가 확보하면 저장소에 함께 정리할 예정입니다.
-
 ## 6. Repository 구조
 
 ```text
