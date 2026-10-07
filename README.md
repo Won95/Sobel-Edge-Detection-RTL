@@ -1,201 +1,345 @@
-# Sobel Edge Detection RTL on FPGA
+# Sobel Edge Detection on FPGA using AXI DMA & AXI4-Stream
 
-FPGA 기반 실시간 영상처리 데이터패스 설계 프로젝트입니다. HDMI 입력 영상에 대해 Sobel edge detection을 수행하고, 연산 경로의 timing bottleneck을 분석한 뒤 pipeline을 적용해 timing을 개선하는 과정을 다룹니다.
+Zybo Z7-10의 **Zynq PS + AXI DMA + AXI4-Stream + custom Sobel RTL IP**를 이용해 구현한 FPGA 이미지 처리 프로젝트입니다.
 
-> Target board: Zybo Z7-10  
-> Design focus: FPGA Algorithm / Data Path / Pipelining / Timing Optimization
+DDR에 저장된 640×480 grayscale 이미지를 AXI DMA로 PL에 전달하고, PL의 Sobel IP가 **3×3 sliding window 기반 edge detection**을 수행한 뒤 처리 결과를 다시 DDR로 반환합니다. RTL 결과는 Python reference model과 비교하여 **pixel-by-pixel mismatch 0**으로 검증했습니다.
 
----
+## Project Highlights
 
-## 1. Project Overview
-
-이 프로젝트의 목적은 단순히 Sobel 알고리즘을 RTL로 옮기는 것이 아니라, 영상처리 알고리즘을 FPGA에서 실시간 처리 가능한 **streaming data path**로 구조화하고, synthesis/timing 결과를 기반으로 병목 경로를 개선하는 것입니다.
-
-### Main Flow
-
-```text
-HDMI / Pixel Stream
-        |
-        v
-  Line Buffer
-        |
-        v
- Sliding 3x3 Window
-        |
-        v
- Sobel Gx / Gy
-        |
-        v
- Gradient Calculation
-        |
-        v
- Threshold / Output
-        |
-        v
-  Video Output
-```
+- Zynq PS ↔ DDR ↔ AXI DMA ↔ PL 데이터 경로 구성
+- AXI4-Stream 기반 custom Sobel RTL IP 설계
+- 2-line buffer + shift register 기반 3×3 sliding window 구현
+- `|Gx| + |Gy|` 근사를 이용한 gradient magnitude 계산
+- 출력 stream 길이를 유지하기 위한 border padding 처리
+- Pipeline fill 이후 **1 pixel / cycle** 처리 구조
+- Python reference 대비 **max error = 0, mismatch = 0**
+- 100 MHz implementation 기준 **WNS = 1.702 ns, TNS = 0 ns**
 
 ---
 
-## 2. Sobel Algorithm
+## 1. System Overview
 
-Sobel operator는 3x3 window를 사용해 수평/수직 방향 gradient를 계산합니다.
+![Zybo Z7-10 Sobel system](https://velog.velcdn.com/images/vom/post/0d167f41-6610-4259-8648-cb02060fd64a/image.jpg)
+
+### Data Flow
 
 ```text
-Gx = [-1  0  1]      Gy = [ 1  2  1]
-     [-2  0  2]           [ 0  0  0]
-     [-1  0  1]           [-1 -2 -1]
+Image header / input data
+        |
+        v
+Zynq PS
+        |
+        v
+DDR Memory
+        |
+        |  AXI DMA MM2S
+        v
+AXI4-Stream
+        |
+        v
+Custom Sobel IP
+        |
+        v
+AXI4-Stream
+        |
+        |  AXI DMA S2MM
+        v
+DDR Memory
+        |
+        v
+Zynq PS
+        |
+        |  UART
+        v
+PC -> output image
 ```
 
-RTL에서는 multiplication을 일반 multiplier로 구현하기보다 coefficient가 `-2, -1, 0, 1, 2`라는 점을 이용해 shift/add/subtract 기반 데이터패스로 구성할 수 있습니다.
+The PS initializes the input image in DDR, configures the DMA transfer, and reads the processed result after the S2MM transfer completes. The Sobel calculation itself is performed in programmable logic as a streaming RTL datapath.
+
+![System architecture](https://velog.velcdn.com/images/vom/post/eec8feff-a40b-42e8-8d8e-6940deb953b9/image.png)
 
 ---
 
-## 3. Hardware Architecture
+## 2. Development Environment
 
-### 3.1 Streaming Data Path
-
-한 픽셀씩 입력되는 영상 스트림을 처리하기 위해 전체 frame을 저장하지 않고 line buffer와 shift register를 이용해 3x3 window를 생성하는 구조를 사용합니다.
-
-```text
-Pixel Input
-    |
-    +---- Line Buffer 0 ----+
-    |                       |
-    +---- Line Buffer 1 ----+--> 3x3 Window --> Sobel Core
-    |                       |
-    +---- Current Line -----+
-```
-
-이 구조의 핵심은 **frame memory 기반 처리 대신 streaming 구조를 사용해 한 clock당 한 pixel 처리 가능한 datapath를 구성하는 것**입니다.
-
-### 3.2 Sobel Data Path
-
-```text
-3x3 Pixels
-    |
-    +--> Gx Add/Sub Tree ---+
-    |                       |
-    +--> Gy Add/Sub Tree ---+--> Gradient --> Threshold --> Edge Pixel
-```
-
----
-
-## 4. Timing Bottleneck & Pipelining
-
-초기 구현에서는 sliding-window 처리와 gradient 연산이 하나의 긴 combinational path에 포함되어 timing violation이 발생했습니다.
-
-초기 timing 분석에서 약 **WNS = -3.5 ns** 수준의 violation이 확인되었으며, 요구 clock period 대비 datapath가 지나치게 길다는 것을 확인했습니다.
-
-### Initial Path
-
-```text
-Window Generation
-      |
-      v
-Gx / Gy Calculation
-      |
-      v
-Gradient Calculation
-      |
-      v
-Output
-```
-
-### Pipelined Path
-
-```text
-Window Generation
-      |
-     REG
-      |
-Gx / Gy Calculation
-      |
-     REG
-      |
-Gradient / Threshold
-      |
-     REG
-      |
-Output
-```
-
-Pipeline register를 삽입하여 combinational path를 여러 stage로 분리하고, 각 stage의 logic depth를 줄이는 방식으로 timing을 개선했습니다.
-
-> Final WNS / Fmax: 자료 정리 후 업데이트 예정
-
----
-
-## 5. Engineering Points
-
-이 프로젝트에서 중점적으로 다룬 내용은 다음과 같습니다.
-
-- Sobel image-processing algorithm의 RTL data path 변환
-- 3x3 sliding window 생성
-- Line buffer 기반 streaming architecture
-- Shift/Add/Subtract 기반 gradient 연산
-- Pipeline stage 분할
-- Critical path 분석
-- Vivado synthesis / implementation timing 분석
-- Latency와 throughput의 trade-off
-
----
-
-## 6. Target FPGA Environment
-
-| Item | Environment |
+| Item | Specification |
 |---|---|
-| FPGA Board | Zybo Z7-10 |
-| FPGA | Xilinx Zynq-7000 |
-| HDL | Verilog HDL |
-| Tool | Xilinx Vivado |
-| Application | Real-time Sobel Edge Detection |
-
-세부 Vivado version, clock frequency, video resolution 등은 프로젝트 파일 확인 후 업데이트합니다.
+| Board | Zybo Z7-10 |
+| Device | `xc7z010clg400-1` |
+| HDL | Verilog |
+| FPGA Tool | Vivado |
+| Software Tool | Vitis |
+| Processor | Zynq-7000 Processing System |
+| Streaming Interface | AXI4-Stream |
+| Data Transfer | AXI DMA |
+| Pixel Format | 8-bit grayscale |
+| Resolution | 640 × 480 |
+| Target Clock | 100 MHz |
+| Functional Reference | Python reference model |
 
 ---
 
-## 7. Repository Structure
+## 3. Sobel IP Architecture
+
+The Sobel IP is organized as a streaming datapath:
+
+```text
+AXI4-Stream Input
+        |
+        v
+Line Buffer / 3x3 Window Generator
+        |
+        v
+Sobel Gx / Gy Convolution
+        |
+        v
+Absolute Value / Magnitude Approximation
+        |
+        v
+Border Handling / Output Formatting
+        |
+        v
+AXI4-Stream Output
+```
+
+The design does not store an entire frame inside the Sobel core. Instead, it reuses recently received pixels through line buffers and shift registers to continuously generate a 3×3 neighborhood.
+
+### 3.1 AXI4-Stream Interface
+
+The custom IP is directly connected between the MM2S and S2MM channels of AXI DMA through AXI4-Stream.
+
+The stream protocol allows the image datapath to operate independently of DDR transactions while `TVALID/TREADY` handshake signals control actual data movement. Border pixels are padded so that the **number of output pixels remains equal to the number of input pixels**, which keeps the DMA transfer length consistent.
+
+<p>
+  <img src="https://velog.velcdn.com/images/vom/post/051a1a69-3726-40a4-8353-5918dbbef720/image.jpg" width="49%">
+  <img src="https://velog.velcdn.com/images/vom/post/e6d660f8-5578-45a4-a360-e8725dd9c72f/image.jpg" width="49%">
+</p>
+<p>
+  <img src="https://velog.velcdn.com/images/vom/post/2c536d86-40d5-4e9e-b002-790235caae56/image.jpg" width="49%">
+  <img src="https://velog.velcdn.com/images/vom/post/3d4709fc-8b76-42bb-bff1-09fd7e51cd6f/image.jpg" width="49%">
+</p>
+
+### 3.2 Line Buffer & Sliding Window
+
+A 3×3 convolution requires pixels from the current row and the previous two rows. The design therefore uses **two line buffers plus shift registers** to reuse incoming pixel data and form a sliding 3×3 window.
+
+```text
+Previous row -2  ---- Line Buffer ----+--- 3 pixels
+                                     |
+Previous row -1  ---- Line Buffer ----+--- 3 pixels ---> 3x3 Window
+                                     |
+Current row       ---- Shift Reg ------+--- 3 pixels
+```
+
+After the initial window-fill latency, a new window can be generated for each accepted input pixel.
+
+<p>
+  <img src="https://velog.velcdn.com/images/vom/post/02839836-1281-4437-99a9-ee11128f04ac/image.jpg" width="49%">
+  <img src="https://velog.velcdn.com/images/vom/post/040a22d3-8f28-4e1c-98d3-8716f31806d9/image.jpg" width="49%">
+</p>
+
+### 3.3 Sobel Convolution
+
+The Sobel operator calculates horizontal and vertical gradients using the following kernels.
+
+```text
+Gx = [ -1   0   1 ]      Gy = [ -1  -2  -1 ]
+     [ -2   0   2 ]           [  0   0   0 ]
+     [ -1   0   1 ]           [  1   2   1 ]
+```
+
+Instead of calculating the Euclidean magnitude
+
+```text
+sqrt(Gx^2 + Gy^2)
+```
+
+the RTL uses the hardware-friendly approximation
+
+```text
+magnitude = |Gx| + |Gy|
+```
+
+This avoids square, addition of squares, and square-root hardware while preserving the edge-strength information needed for this application.
+
+<p>
+  <img src="https://velog.velcdn.com/images/vom/post/a4f4a63d-29a3-42a4-855e-cbcdaa9d094d/image.jpg" width="32%">
+  <img src="https://velog.velcdn.com/images/vom/post/34426e7b-e145-436b-ab6d-28cdb435c266/image.jpg" width="32%">
+  <img src="https://velog.velcdn.com/images/vom/post/01199a0e-caaa-4cdf-9b51-63ad757a83b0/image.jpg" width="32%">
+</p>
+<p>
+  <img src="https://velog.velcdn.com/images/vom/post/d5770f77-81b9-4481-9c9b-ec05e71c6a1f/image.jpg" width="49%">
+  <img src="https://velog.velcdn.com/images/vom/post/0b66784e-607e-440f-950e-a4731e5e51c0/image.jpg" width="49%">
+</p>
+
+---
+
+## 4. Throughput and Latency
+
+The final Sobel datapath is designed for a throughput of **one accepted pixel per clock cycle** after the pipeline/window-fill latency.
+
+### Theoretical Core Throughput
+
+```text
+1 pixel / cycle
+```
+
+For a 640×480 image:
+
+```text
+640 × 480 = 307,200 pixels
+```
+
+At a 100 MHz clock, the ideal streaming time for 307,200 pixel transfers is:
+
+```text
+307,200 cycles / 100,000,000 cycles/s
+= 3.072 ms
+```
+
+| Metric | Value |
+|---|---:|
+| Resolution | 640 × 480 |
+| Pixels per frame | 307,200 |
+| Target clock | 100 MHz |
+| Steady-state throughput | 1 pixel / cycle |
+| Ideal core stream time | 3.072 ms / frame |
+
+> **Note:** `3.072 ms` is a theoretical Sobel-core streaming value assuming continuous `TVALID/TREADY` handshakes with no backpressure. It does **not** include PS software overhead, DDR/DMA setup latency, UART transfer time, or other end-to-end system overhead.
+
+---
+
+## 5. Design Trade-off: Parallelism vs FPGA Resources
+
+An early architecture attempted to process multiple pixels in parallel. Expanding the sliding-window and Sobel arithmetic for multiple simultaneous pixels increased the amount of duplicated combinational logic and LUT usage until the design exceeded the available resources of the target device.
+
+The architecture was therefore redesigned around a **1 pixel/cycle streaming pipeline**.
+
+```text
+More pixel-level parallelism
+        |
+        +--> Higher instantaneous computation
+        |
+        +--> Duplicated window / arithmetic logic
+        |
+        +--> Higher LUT / FF utilization
+        |
+        v
+Resource limit on xc7z010
+
+            ↓ redesign
+
+1 pixel/cycle streaming architecture
+        |
+        +--> Continuous pipeline
+        +--> Lower resource pressure
+        +--> 100 MHz timing closure
+```
+
+This was a deliberate architecture trade-off: rather than maximizing spatial parallelism, the final design targets a sustainable streaming throughput that fits the Zybo Z7-10 device.
+
+---
+
+## 6. Functional Verification
+
+The input image was converted to grayscale and resized to **640×480** in Python before being used by the FPGA system.
+
+### 6.1 Input Image
+
+| Original | 640×480 Input |
+|---|---|
+| ![Original image](https://velog.velcdn.com/images/vom/post/84273bf8-9e53-4586-81df-ce3cf05c5eb7/image.png) | ![Resized input](https://velog.velcdn.com/images/vom/post/b23a563f-e05d-4632-8a19-118f2777fbee/image.png) |
+
+### 6.2 Python Reference vs FPGA Output
+
+The same Sobel algorithm and border behavior were implemented in Python and used as a reference model.
+
+| Python Reference | FPGA Output |
+|---|---|
+| ![Python reference](https://velog.velcdn.com/images/vom/post/ddf5f546-1725-4d1b-a493-322bdaab7879/image.png) | ![FPGA output](https://velog.velcdn.com/images/vom/post/f9004dee-1a3b-47db-af3e-9ab7005b6525/image.png) |
+
+### 6.3 Pixel-by-Pixel Difference Check
+
+![Difference check](https://velog.velcdn.com/images/vom/post/d22e4336-0e3f-42b3-bd4d-486c2630d65b/image.png)
+
+```text
+max error      : 0
+mismatch count : 0
+mismatch ratio : 0%
+```
+
+The FPGA output matched the Python reference for every compared pixel in the test image.
+
+---
+
+## 7. Implementation Results
+
+The design was synthesized and implemented in Vivado for `xc7z010clg400-1` at a 100 MHz target clock.
+
+![Vivado implementation result](https://velog.velcdn.com/images/vom/post/15c43b43-1508-4b1a-b43f-9690c00294e2/image.png)
+
+| Item | Result |
+|---|---:|
+| WNS | **1.702 ns** |
+| TNS | **0 ns** |
+| LUT | 6,659 / 17,600 (**37.84%**) |
+| FF | 13,990 / 35,200 (**39.74%**) |
+| BRAM | 2 / 60 (**3.33%**) |
+| On-Chip Power | **1.535 W** |
+
+A positive WNS and zero TNS indicate that the constrained 100 MHz design closed timing in the reported implementation run.
+
+---
+
+## 8. What This Project Demonstrates
+
+This project focuses on the process of turning an image-processing algorithm into an FPGA streaming architecture rather than only implementing the Sobel equation itself.
+
+```text
+Image-processing algorithm
+        ↓
+3x3 neighborhood requirement
+        ↓
+Line-buffer / sliding-window architecture
+        ↓
+Streaming Sobel datapath
+        ↓
+AXI4-Stream integration
+        ↓
+AXI DMA + Zynq PS system integration
+        ↓
+Python reference verification
+        ↓
+Synthesis / implementation / timing closure
+```
+
+Key engineering topics demonstrated in the project are:
+
+- algorithm-to-datapath conversion
+- streaming image processing
+- line-buffer based data reuse
+- sliding-window generation
+- AXI4-Stream handshake integration
+- AXI DMA based PS–PL data movement
+- resource/parallelism trade-off
+- Python golden/reference model based RTL verification
+- Vivado synthesis, implementation, utilization, and timing analysis
+
+---
+
+## 9. Repository Structure
+
+The repository will be organized around source files required to reproduce and review the design rather than the entire generated Vivado project directory.
 
 ```text
 Sobel-Edge-Detection-RTL/
 ├── README.md
-├── rtl/            # Synthesizable Verilog RTL
-├── tb/             # Testbench / simulation files
-├── constraints/    # XDC constraints
-├── docs/           # Architecture / timing / design notes
-└── assets/         # Block diagrams, waveform, Vivado screenshots, result images
+├── rtl/                 # Synthesizable Verilog RTL
+├── constraints/         # XDC constraints
+├── software/            # Vitis / PS-side DMA control code
+├── python/              # Image preprocessing and reference model
+├── docs/                # Architecture and design notes
+└── assets/              # Diagrams, result images, screenshots
 ```
 
----
-
-## 8. Results
-
-아래 자료를 추가해 최종 포트폴리오 형태로 정리할 예정입니다.
-
-| Result | Status |
-|---|---|
-| Original input image/frame | To be added |
-| Sobel output image/frame | To be added |
-| RTL block diagram | To be added |
-| Simulation waveform | To be added |
-| Synthesis utilization | To be added |
-| Initial timing report | WNS ≈ -3.5 ns |
-| Pipelined timing report | To be added |
-
----
-
-## 9. Portfolio Focus
-
-이 프로젝트는 FPGA를 단순히 HDL 코딩 대상으로 접근하기보다,
-
-**Algorithm → Data Path → Pipeline → Timing Analysis → Optimization**
-
-의 흐름으로 설계한 경험을 보여주는 것을 목표로 합니다.
-
-특히 FPGA Algorithm / RTL / Digital Design 직무에서 다음 역량을 보여줄 수 있도록 저장소를 구성합니다.
-
-- 알고리즘의 hardware architecture 변환 능력
-- streaming datapath 설계 경험
-- pipeline 기반 timing optimization 경험
-- synthesis / implementation 결과 기반 설계 개선 경험
+Generated Vivado cache/run directories and machine-specific temporary files are intentionally excluded.
