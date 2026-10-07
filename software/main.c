@@ -1,68 +1,31 @@
 #include <stdio.h>
 #include "xaxidma.h"
-#include "xaxidma_hw.h"
-#include "xgpio.h"
 #include "xparameters.h"
 #include "xstatus.h"
 #include "xil_cache.h"
 #include "xil_types.h"
 #include "image_data.h"
 
-#define MEM_BASE_ADDR 0x01000000U
+#define MEM_BASE_ADDR   0x01000000U
+#define TX_BUFFER_BASE  (MEM_BASE_ADDR + 0x00100000U)
+#define RX_BUFFER_BASE  (MEM_BASE_ADDR + 0x00300000U)
 
-#define TX_BUFFER_BASE (MEM_BASE_ADDR + 0x00100000U)
-#define RX_BUFFER_BASE (MEM_BASE_ADDR + 0x00300000U)
-
-#define WIDTH  IMG_WIDTH
-#define HEIGHT IMG_HEIGHT
-#define LENGTH (WIDTH * HEIGHT)
-
-#define TX_BYTES (LENGTH * 4)
-#define RX_BYTES (LENGTH * 4)
-
-/*
-debug_sel meaning
-0 : mag
-1 : bot_new
-2 : mid_new
-3 : top_new
-4 : w11
-5 : w12
-6 : abs_gx
-7 : abs_gy
-8 : constant 0xAA
-*/
-#define DEBUG_SEL_MODE 0
+#define WIDTH            IMG_WIDTH
+#define HEIGHT           IMG_HEIGHT
+#define PIXEL_COUNT      (WIDTH * HEIGHT)
+#define DMA_WORD_BYTES   4U
+#define TX_BYTES         (PIXEL_COUNT * DMA_WORD_BYTES)
+#define RX_BYTES         (PIXEL_COUNT * DMA_WORD_BYTES)
 
 XAxiDma AxiDma;
-XGpio   Gpio;
 
 extern void outbyte(char c);
-
-static int init_gpio(void)
-{
-    int Status;
-
-    Status = XGpio_Initialize(&Gpio, XPAR_AXI_GPIO_0_BASEADDR);
-    if (Status != XST_SUCCESS) {
-        printf("GPIO init failed\r\n");
-        return XST_FAILURE;
-    }
-
-    XGpio_SetDataDirection(&Gpio, 1, 0x0);
-    return XST_SUCCESS;
-}
-
-static void sobel_set_debug_sel(u32 mode)
-{
-    XGpio_DiscreteWrite(&Gpio, 1, mode & 0xF);
-}
 
 int main(void)
 {
     int i;
     int Status;
-    int timeout;
+    u32 timeout;
     XAxiDma_Config *CfgPtr;
 
     u32 *TxBufferPtr = (u32 *)TX_BUFFER_BASE;
@@ -70,17 +33,9 @@ int main(void)
 
     printf("DMA Sobel Test Start\r\n");
     printf("Image size: %d x %d\r\n", WIDTH, HEIGHT);
-    printf("Pixel count: %d\r\n", LENGTH);
+    printf("Pixel count: %d\r\n", PIXEL_COUNT);
     printf("TX bytes: %d\r\n", TX_BYTES);
     printf("RX bytes: %d\r\n", RX_BYTES);
-
-    Status = init_gpio();
-    if (Status != XST_SUCCESS) {
-        return XST_FAILURE;
-    }
-
-    sobel_set_debug_sel(DEBUG_SEL_MODE);
-    printf("debug_sel = %d\r\n", DEBUG_SEL_MODE);
 
     CfgPtr = XAxiDma_LookupConfig(XPAR_XAXIDMA_0_BASEADDR);
     if (CfgPtr == NULL) {
@@ -99,9 +54,16 @@ int main(void)
         return XST_FAILURE;
     }
 
-    printf("Expanding input buffer to 32-bit per pixel...\r\n");
-    for (i = 0; i < LENGTH; i++) {
-        /* little-endian memory view: [pixel][00][00][00] */
+    /*
+     * AXI DMA stream width is 32 bits, while one grayscale pixel is 8 bits.
+     * Store one pixel in the LSB of each 32-bit word:
+     *
+     *   memory/stream word = 0x000000PP
+     *
+     * Therefore 640x480 pixels correspond to 307,200 AXI stream beats and
+     * 307,200 * 4 bytes of DMA memory traffic in each direction.
+     */
+    for (i = 0; i < PIXEL_COUNT; i++) {
         TxBufferPtr[i] = (u32)image_data[i];
         RxBufferPtr[i] = 0U;
     }
@@ -109,6 +71,7 @@ int main(void)
     Xil_DCacheFlushRange((UINTPTR)TxBufferPtr, TX_BYTES);
     Xil_DCacheFlushRange((UINTPTR)RxBufferPtr, RX_BYTES);
 
+    /* Arm S2MM before starting MM2S so the output path is ready first. */
     Status = XAxiDma_SimpleTransfer(&AxiDma,
                                     (UINTPTR)RxBufferPtr,
                                     RX_BYTES,
@@ -127,20 +90,20 @@ int main(void)
         return XST_FAILURE;
     }
 
-    timeout = 0xffffffff;
-    while (XAxiDma_Busy(&AxiDma, XAXIDMA_DMA_TO_DEVICE) && timeout > 0) {
+    timeout = 0xFFFFFFFFU;
+    while (XAxiDma_Busy(&AxiDma, XAXIDMA_DMA_TO_DEVICE) && timeout > 0U) {
         timeout--;
     }
-    if (timeout == 0) {
+    if (timeout == 0U) {
         printf("TX DMA timeout\r\n");
         return XST_FAILURE;
     }
 
-    timeout = 0xffffffff;
-    while (XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA) && timeout > 0) {
+    timeout = 0xFFFFFFFFU;
+    while (XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA) && timeout > 0U) {
         timeout--;
     }
-    if (timeout == 0) {
+    if (timeout == 0U) {
         printf("RX DMA timeout\r\n");
         return XST_FAILURE;
     }
@@ -150,9 +113,9 @@ int main(void)
     printf("Transfer done\r\n");
     printf("IMG %d %d\r\n", WIDTH, HEIGHT);
 
-    /* LSB 1byte만 UART로 전송 */
-    for (i = 0; i < LENGTH; i++) {
-        outbyte((char)(RxBufferPtr[i] & 0xFF));
+    /* Convert each 32-bit result word back to one grayscale byte for UART. */
+    for (i = 0; i < PIXEL_COUNT; i++) {
+        outbyte((char)(RxBufferPtr[i] & 0xFFU));
     }
 
     printf("\r\nDONE\r\n");
