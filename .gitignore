@@ -1,0 +1,40 @@
+# Vivado generated files
+*.jou
+*.log
+*.str
+*.tmp
+*.wdb
+*.wcfg
+*.pb
+*.dcp
+*.bit
+*.bin
+*.ltx
+*.hwdef
+*.hwh
+*.xsa
+
+# Vivado project/cache directories
+.cache/
+.gen/
+.hw/
+.ip_user_files/
+.runs/
+.sim/
+.srcs/
+Xil/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# Temporary / backup
+*~
+*.bak
+*.swp
