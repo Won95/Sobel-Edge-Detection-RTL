@@ -24,6 +24,13 @@
 .srcs/
 Xil/
 
+# Generated software/image data
+image_data.h
+software/image_data.h
+
+# Local generated verification outputs
+rx_values.txt
+
 # OS / editor
 .DS_Store
 Thumbs.db
